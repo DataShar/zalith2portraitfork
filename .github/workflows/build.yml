@@ -1,0 +1,299 @@
+name: Build Zalith Portrait Handheld APK
+
+# Run it from the Actions tab: "Run workflow". ~20-30 min. APK lands in Releases.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "ZalithLauncher2 commit to patch (default is the tested one)"
+        default: "b8275403823239f6a3d6ee1b93e9db5be68d2a2b"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout upstream ZalithLauncher2
+        uses: actions/checkout@v4
+        with:
+          repository: ZalithLauncher/ZalithLauncher2
+          ref: ${{ inputs.upstream_ref }}
+          submodules: recursive
+
+      - name: Write patch script
+        run: |
+          cat > "$RUNNER_TEMP/apply_handheld.py" <<'PYEOF'
+          import sys
+          B = 'ZalithLauncher/src/main/'
+          J = B + 'java/com/movtery/zalithlauncher/'
+
+          def sub(path, old, new):
+              s = open(path, encoding='utf-8').read()
+              n = s.count(old)
+              if n != 1:
+                  sys.exit('PATCH FAILED: %s matched %d times for: %s' % (path, n, old[:70].replace('\n', ' ')))
+              open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+
+          # ---- settings ----
+          sub(J + 'setting/RendererSettings.kt',
+          '''    val customResolutionHeight = intSetting("customResolutionHeight", 0)
+          ''',
+          '''    val customResolutionHeight = intSetting("customResolutionHeight", 0)
+
+              /**
+               * Portrait handheld mode: portrait display, game rendered 4:3 and pinned to the top
+               */
+              val portraitHandheld = boolSetting("portraitHandheld", false)
+
+              /**
+               * Render width in portrait handheld mode (height follows 4:3)
+               */
+              val portraitHandheldWidth = intSetting("portraitHandheldWidth", 1280, 640..2560)
+          ''')
+
+          # ---- GameResolution.kt ----
+          p = J + 'utils/GameResolution.kt'
+          sub(p, '''    customWidth: Int,
+              customHeight: Int
+          ): IntSize {
+              return if (rule == ResolutionRule.CUSTOM) {''', '''    customWidth: Int,
+              customHeight: Int,
+              handheld: Boolean = false,
+              handheldWidth: Int = 1280
+          ): IntSize {
+              if (handheld) {
+                  val width = getDisplayFriendlyRes(handheldWidth.coerceAtLeast(2), 1f).coerceAtLeast(2)
+                  return IntSize(width, getDisplayFriendlyRes(width * 3 / 4, 1f).coerceAtLeast(2))
+              }
+              return if (rule == ResolutionRule.CUSTOM) {''')
+          sub(p, '''    customHeight = RendererSettings.customResolutionHeight.flow.value,
+          )''', '''    customHeight = RendererSettings.customResolutionHeight.flow.value,
+              handheld = RendererSettings.portraitHandheld.flow.value,
+              handheldWidth = RendererSettings.portraitHandheldWidth.flow.value,
+          )''')
+          sub(p, '''    val customHeight = RendererSettings.customResolutionHeight.state
+              return remember(screenSize, rule, percentage, customWidth, customHeight) {
+                  computeGameRenderSize(screenSize, rule, percentage, customWidth, customHeight)
+              }''', '''    val customHeight = RendererSettings.customResolutionHeight.state
+              val handheld = RendererSettings.portraitHandheld.state
+              val handheldWidth = RendererSettings.portraitHandheldWidth.state
+              return remember(screenSize, rule, percentage, customWidth, customHeight, handheld, handheldWidth) {
+                  computeGameRenderSize(screenSize, rule, percentage, customWidth, customHeight, handheld, handheldWidth)
+              }''')
+          sub(p, '''    val customHeight = RendererSettings.customResolutionHeight.state
+              val layout = remember(screenSize, rule, percentage, customWidth, customHeight) {
+                  val renderSize = computeGameRenderSize(
+                      screenSize = screenSize,
+                      rule = rule,
+                      percentage = percentage,
+                      customWidth = customWidth,
+                      customHeight = customHeight
+                  )
+                  if (rule == ResolutionRule.CUSTOM) {
+                      computeGameDisplayLayout(screenSize, renderSize)
+                  } else {''', '''    val customHeight = RendererSettings.customResolutionHeight.state
+              val handheld = RendererSettings.portraitHandheld.state
+              val handheldWidth = RendererSettings.portraitHandheldWidth.state
+              val layout = remember(screenSize, rule, percentage, customWidth, customHeight, handheld, handheldWidth) {
+                  val renderSize = computeGameRenderSize(
+                      screenSize = screenSize,
+                      rule = rule,
+                      percentage = percentage,
+                      customWidth = customWidth,
+                      customHeight = customHeight,
+                      handheld = handheld,
+                      handheldWidth = handheldWidth
+                  )
+                  if (handheld) {
+                      computeGameDisplayLayout(screenSize, renderSize, topAligned = true)
+                  } else if (rule == ResolutionRule.CUSTOM) {
+                      computeGameDisplayLayout(screenSize, renderSize)
+                  } else {''')
+          sub(p, '''fun computeGameDisplayLayout(screenSize: IntSize, renderSize: IntSize): GameDisplayLayout {''', '''fun computeGameDisplayLayout(
+              screenSize: IntSize,
+              renderSize: IntSize,
+              topAligned: Boolean = false
+          ): GameDisplayLayout {''')
+          sub(p, '''            y = (screenSize.height - displaySize.height) / 2
+                  )''', '''            y = if (topAligned) 0 else (screenSize.height - displaySize.height) / 2
+                  )''')
+
+          # ---- VMActivity.kt ----
+          p = J + 'ui/activities/VMActivity.kt'
+          sub(p, '''        super.setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE)''', '''        super.setRequestedOrientation(
+                      if (RendererSettings.portraitHandheld.getValue()) ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                      else ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                  )''')
+          sub(p, '''        super.onCreate(savedInstanceState)
+
+                  //初始化物理鼠标连接检查器''', '''        super.onCreate(savedInstanceState)
+
+                  //Portrait handheld mode: re-apply orientation from settings (value decided by the setRequestedOrientation override)
+                  requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+
+                  //初始化物理鼠标连接检查器''')
+          sub(p, '''            val letterboxed = layout?.session?.handler?.type == HandlerType.GAME &&
+                              RendererSettings.resolutionRule.state == ResolutionRule.CUSTOM
+                      val renderSize = rememberGameRenderSize(screenSize)
+                      val displaySize = if (letterboxed) computeGameDisplayLayout(screenSize, renderSize).displaySize else screenSize
+          ''', '''            val portraitHandheld = RendererSettings.portraitHandheld.state
+                      val letterboxed = layout?.session?.handler?.type == HandlerType.GAME &&
+                              (portraitHandheld || RendererSettings.resolutionRule.state == ResolutionRule.CUSTOM)
+                      val renderSize = rememberGameRenderSize(screenSize)
+                      val displaySize = if (letterboxed) {
+                          computeGameDisplayLayout(screenSize, renderSize, topAligned = portraitHandheld).displaySize
+                      } else screenSize
+          ''')
+          sub(p, '''                            .align(Alignment.Center)
+                                      .size(
+                                          width = with(density) { displaySize.width.toDp() },''', '''                            .align(if (portraitHandheld) Alignment.TopCenter else Alignment.Center)
+                                      .size(
+                                          width = with(density) { displaySize.width.toDp() },''')
+
+          # ---- Hotbar.kt ----
+          p = J + 'ui/control/Hotbar.kt'
+          sub(p, '''    displayOffset: IntOffset = IntOffset.Zero,
+              onOccupiedPointer''', '''    displayOffset: IntOffset = IntOffset.Zero,
+              bottomInset: Int? = null,
+              displayScale: Float = 1f,
+              onOccupiedPointer''')
+          sub(p, '''                val slotSize = guiScale * 20
+          ''', '''                val slotSize = guiScale * 20 * displayScale
+          ''')
+          sub(p, '''                isGrabbing, optionsChangeKey, screenSize, density,
+                          renderSize, windowChangeKey
+                      ) {''', '''                isGrabbing, optionsChangeKey, screenSize, density,
+                          renderSize, windowChangeKey, displayScale
+                      ) {''')
+          sub(p, '''                IntOffset(x = 0, y = -displayOffset.y)''', '''                IntOffset(x = 0, y = -(bottomInset ?: displayOffset.y))''')
+
+          # ---- GameScreen.kt ----
+          p = J + 'ui/screens/game/GameScreen.kt'
+          sub(p, 'import com.movtery.zalithlauncher.ui.control.MinecraftHotbar\n',
+                 'import com.movtery.zalithlauncher.setting.RendererSettings\nimport com.movtery.zalithlauncher.ui.control.MinecraftHotbar\n')
+          sub(p, '''                displayOffset = displayLayoutState.current.offset,
+                          onOccupiedPointer''', '''                displayOffset = displayLayoutState.current.offset,
+                          bottomInset = if (RendererSettings.portraitHandheld.state) {
+                              val layout = displayLayoutState.current
+                              (screenSize.height - layout.offset.y - layout.displaySize.height).coerceAtLeast(0)
+                          } else null,
+                          displayScale = if (RendererSettings.portraitHandheld.state) {
+                              val layout = displayLayoutState.current
+                              layout.displaySize.width / layout.renderSize.width.toFloat()
+                          } else 1f,
+                          onOccupiedPointer''')
+
+          # ---- Settings UI ----
+          sub(J + 'ui/screens/content/settings/RendererSettingsScreen.kt', '''                    SwitchSettingsCard(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  position = CardPosition.Bottom,
+                                  unit = RendererSettings.gameFullScreen,
+                                  title = stringResource(R.string.settings_renderer_full_screen_title),
+                                  summary = stringResource(R.string.settings_renderer_full_screen_summary)
+                              )
+          ''', '''                    SwitchSettingsCard(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  position = CardPosition.Middle,
+                                  unit = RendererSettings.gameFullScreen,
+                                  title = stringResource(R.string.settings_renderer_full_screen_title),
+                                  summary = stringResource(R.string.settings_renderer_full_screen_summary)
+                              )
+
+                              SwitchSettingsCard(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  position = CardPosition.Middle,
+                                  unit = RendererSettings.portraitHandheld,
+                                  title = stringResource(R.string.settings_renderer_portrait_handheld_title),
+                                  summary = stringResource(R.string.settings_renderer_portrait_handheld_summary)
+                              )
+
+                              IntSliderSettingsCard(
+                                  modifier = Modifier.fillMaxWidth(),
+                                  position = CardPosition.Bottom,
+                                  unit = RendererSettings.portraitHandheldWidth,
+                                  title = stringResource(R.string.settings_renderer_portrait_handheld_width_title),
+                                  summary = stringResource(R.string.settings_renderer_portrait_handheld_width_summary),
+                                  valueRange = RendererSettings.portraitHandheldWidth.floatRange,
+                                  suffix = "px",
+                                  fineTuningControl = true
+                              )
+          ''')
+
+          # ---- Strings ----
+          sub(B + 'res/values/strings.xml', '''    <!-- Switch title in the Renderer settings tab to enable the sustained performance mode -->''', '''    <!-- Switch title in the Renderer settings tab for portrait handheld mode -->
+              <string name="settings_renderer_portrait_handheld_title">Portrait Handheld Mode</string>
+              <!-- Summary of the portrait handheld mode switch in the Renderer settings tab -->
+              <string name="settings_renderer_portrait_handheld_summary">Show the launcher in portrait: the game renders at 4:3 pinned to the top of the screen, and the bottom half is left for touch controls. Takes effect the next time you launch a game</string>
+              <!-- Slider title for the render width used by portrait handheld mode -->
+              <string name="settings_renderer_portrait_handheld_width_title">Handheld render width</string>
+              <!-- Summary of the render width slider of portrait handheld mode -->
+              <string name="settings_renderer_portrait_handheld_width_summary">Game render width in portrait handheld mode; the height follows 4:3 (1280 gives 1280x960)</string>
+              <!-- Switch title in the Renderer settings tab to enable the sustained performance mode -->''')
+          sub(B + 'res/values-zh-rCN/strings.xml', '''    <string name="settings_renderer_sustained_performance_title">''', '''    <string name="settings_renderer_portrait_handheld_title">竖屏掌机模式</string>
+              <string name="settings_renderer_portrait_handheld_summary">以竖屏显示：游戏以 4:3 渲染并贴在屏幕顶部，下半屏留给触控按键。下次启动游戏时生效</string>
+              <string name="settings_renderer_portrait_handheld_width_title">掌机渲染宽度</string>
+              <string name="settings_renderer_portrait_handheld_width_summary">竖屏掌机模式下的游戏渲染宽度，高度按 4:3 计算（1280 即 1280x960）</string>
+              <string name="settings_renderer_sustained_performance_title">''')
+          print('patch applied OK')
+          PYEOF
+
+      - name: Apply portrait handheld patch
+        run: python3 "$RUNNER_TEMP/apply_handheld.py"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: |
+          version="4.1.2"
+          curl -sL "https://github.com/bbqsrc/cargo-ndk/releases/download/v${version}/cargo-ndk-x86_64-unknown-linux-gnu-v${version}.tgz" |
+            tar xz -C "$HOME/.cargo/bin" --strip-components=1
+          chmod +x "$HOME/.cargo/bin"/cargo-ndk*
+          cargo ndk --version
+
+      - name: Setup Android NDK
+        run: |
+          ndk=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -1)
+          if [ -z "$ndk" ] || [ ! -f "$ndk/source.properties" ]; then
+            sdkmanager --install "ndk;27.0.12077973"
+            ndk=$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)
+          fi
+          echo "Using NDK at $ndk"
+          test -f "$ndk/source.properties"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Build debug APK (arm64)
+        run: |
+          chmod +x gradlew
+          ./gradlew ZalithLauncher:assembleDebug -Darch=arm64
+
+      - name: Publish APK as a release (easy download on phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk=$(ls ZalithLauncher/build/outputs/apk/debug/*.apk | head -n1)
+          cp "$apk" Zalith-Portrait-Handheld-arm64.apk
+          gh release create "handheld-${{ github.run_number }}" Zalith-Portrait-Handheld-arm64.apk \
+            --repo "${{ github.repository }}" \
+            --title "Portrait Handheld build ${{ github.run_number }}" \
+            --notes "Debug-signed arm64 APK. Package: com.movtery.zalithlauncher.v2.debug"
+
+      - name: Also keep as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zalith-portrait-handheld-arm64
+          path: Zalith-Portrait-Handheld-arm64.apk
